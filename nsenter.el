@@ -1,6 +1,6 @@
 ;;; nsenter.el --- Fast access to your Linux namespaces -*- lexical-binding: t; -*-
 
-;; Package-Requires: ((emacs "30.1"))
+;; Package-Requires: ((emacs "29.1"))
 
 ;;; Commentary:
 
