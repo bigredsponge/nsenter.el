@@ -1,0 +1,43 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # The nix-emacs-ci revision that Emacs comes from, pinned so that its
+  # changes reach CI only when this changes.
+  NIX_EMACS_CI_REF: 0a9a83561eac8862a2e35c0cf1c239621147021c
+
+jobs:
+  test:
+    name: Emacs ${{ matrix.emacs }}, ${{ matrix.environment }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs: ["29.1", "31.1"]
+        environment: [podman, nix]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      # Prebuilt Emacs versions from nix-emacs-ci.
+      - uses: cachix/cachix-action@v16
+        with:
+          name: emacs-ci
+      - name: Install Emacs ${{ matrix.emacs }}
+        env:
+          EMACS_VERSION: ${{ matrix.emacs }}
+        run: |
+          nix profile install \
+            "github:purcell/nix-emacs-ci/$NIX_EMACS_CI_REF#emacs-${EMACS_VERSION//./-}"
+          emacs --version
+      - uses: extractions/setup-just@v3
+      # Ubuntu's AppArmor keeps unconfined programs, like nix and nsenter,
+      # from making user namespaces.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: just compile lint test-${{ matrix.environment }}
