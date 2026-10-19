@@ -74,6 +74,9 @@ inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
 ;; is exactly that command.  The pid is remembered on the Emacs process, so it
 ;; is found again only after the environment restarts.
 
+(define-error 'nsenter-environment-unavailable
+  "Environment did not start")
+
 (defun nsenter--environment-process-name (environment)
   "Return the name of the Emacs process inside ENVIRONMENT."
   (concat "nsenter " environment))
@@ -118,6 +121,10 @@ inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
       ;; A dead process keeps its name, and `make-process' would then pick
       ;; another one, like "nsenter box<2>".
       (when old (delete-process old))
+      ;; Background code, like saveplace, binds `non-essential' so as not to
+      ;; wait for connections.
+      (when non-essential
+        (throw 'nsenter-non-essential 'nsenter-non-essential))
       (let* ((settings (alist-get environment nsenter-environments
                                   nil nil #'equal))
              (enter (plist-get settings :enter))
@@ -146,14 +153,16 @@ inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
              (line (car (last command))))
         ;; The :enter command may print its own progress first.
         (with-timeout (nsenter-start-timeout
-                       (error "Environment %s did not start" environment))
+                       (signal 'nsenter-environment-unavailable
+                               (list environment)))
           (while (and (process-live-p process)
                       (not (nsenter--environment-started-p process line)))
             (accept-process-output process)))
         (or (nsenter--environment-find-pid command)
-            (error "Environment %s did not start: %s" environment
-                   (with-current-buffer (process-buffer process)
-                     (buffer-string))))))))
+            (signal 'nsenter-environment-unavailable
+                    (list environment
+                          (with-current-buffer (process-buffer process)
+                            (buffer-string)))))))))
 
 (defun nsenter--environment-of-pid (pid)
   "Return the environment whose process inside has host pid PID."
@@ -544,6 +553,16 @@ Their results are translated back.")
 They only take names apart, or ask about the host.")
 
 (defun nsenter--handler (operation &rest arguments)
+  "Perform OPERATION on ARGUMENTS by the table that lists OPERATION.
+If that would start an environment while `non-essential' is non-nil,
+perform OPERATION as if there were no handler, as TRAMP does."
+  (let ((result (catch 'nsenter-non-essential
+                  (list (apply #'nsenter--perform operation arguments)))))
+    (if (eq result 'nsenter-non-essential)
+        (nsenter--apply-operation-bare operation arguments)
+      (car result))))
+
+(defun nsenter--perform (operation &rest arguments)
   "Perform OPERATION on ARGUMENTS by the table that lists OPERATION."
   (let ((custom (alist-get operation nsenter--custom-operations))
         (nofollow (memq operation nsenter--translated-link-operations)))
