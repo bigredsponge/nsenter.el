@@ -181,4 +181,34 @@
     (should-error (file-exists-p "/ns:broken:/etc")
                   :type 'nsenter-environment-unavailable)))
 
+(defun nsenter-test-environment-running (name script)
+  "Return `nsenter-environments' plus NAME, entered by running SCRIPT first.
+SCRIPT is shell code, after which the command to enter with runs on the host."
+  (cons `(,name :enter ("sh" "-c" ,(concat script "; exec \"$@\"") "sh"))
+        nsenter-environments))
+
+(ert-deftest nsenter-test-environment-shows-progress ()
+  "While entering, the last line that the :enter command printed shows."
+  (let ((nsenter-environments
+         (nsenter-test-environment-running
+          "talking" "echo Pulling image...; sleep 0.5"))
+        (shown nil))
+    (cl-letf (((symbol-function 'progress-reporter-update)
+               (lambda (_reporter _value suffix) (push suffix shown))))
+      (should (file-exists-p "/ns:talking:/etc")))
+    (should (member "Pulling image..." shown))))
+
+(ert-deftest nsenter-test-environment-stuck ()
+  "An environment stuck while entering stops at the timeout.
+The error shows what the :enter command printed, and the next attempt
+starts the environment again rather than waiting for the stuck one."
+  (let* ((nsenter-environments
+          (nsenter-test-environment-running
+           "stuck" "printf 'Create it now? [Y/n]: '; read answer"))
+         (nsenter-start-timeout 1)
+         (err (should-error (file-exists-p "/ns:stuck:/etc")
+                            :type 'nsenter-environment-unavailable)))
+    (should (string-search "Create it now?" (nth 2 err)))
+    (should-not (process-live-p (get-process "nsenter stuck")))))
+
 ;;; nsenter-scenarios-test.el ends here

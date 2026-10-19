@@ -145,26 +145,53 @@ inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
   (process-live-p
    (get-process (nsenter--environment-process-name environment))))
 
+(defun nsenter--environment-output (process)
+  "Return what PROCESS has printed."
+  (with-current-buffer (process-buffer process)
+    (buffer-string)))
+
+(defun nsenter--environment-last-line (process)
+  "Return the last line that PROCESS has printed, or nil."
+  (car (last (split-string (nsenter--environment-output process) "\n" t
+                           "[[:space:]]+"))))
+
 (defun nsenter--environment-pid (environment)
   "Return the host pid of the process inside ENVIRONMENT."
   (let ((process (nsenter--environment-process environment)))
     (with-memoization (process-get process 'nsenter-pid)
       (let* ((command (nsenter--environment-process-command environment))
-             (line (car (last command))))
-        ;; The :enter command may print its own progress first.
-        (with-timeout (nsenter-start-timeout
-                       (signal 'nsenter-environment-unavailable
-                               (list environment)))
-          (while (and (process-live-p process)
-                      (not (nsenter--environment-started-p process line)))
-            ;; Without a timeout, Emacs warns of a blocking call whenever a
-            ;; timer opens a file, as timers inhibit quitting.
-            (accept-process-output process 0.1)))
+             (line (car (last command)))
+             (reporter (make-progress-reporter
+                        (format "Entering %s..." environment)))
+             (started nil))
+        (unwind-protect
+            (with-timeout (nsenter-start-timeout
+                           (signal 'nsenter-environment-unavailable
+                                   (list environment
+                                         (nsenter--environment-output
+                                          process))))
+              (while (and (process-live-p process)
+                          (not (setq started (nsenter--environment-started-p
+                                              process line))))
+                ;; Without a timeout, Emacs warns of a blocking call whenever
+                ;; a timer opens a file, as timers inhibit quitting.
+                (accept-process-output process 0.1)
+                ;; The :enter command may print its own progress first, or
+                ;; wait for an answer that it asks for, which shows here.
+                (progress-reporter-update
+                 reporter nil (nsenter--environment-last-line process))
+                ;; Emacs would not show it while a command, like `find-file'
+                ;; checking its minibuffer, keeps running.
+                (redisplay)))
+          ;; Otherwise `nsenter--environment-process' would find a process
+          ;; stuck after a quit or the timeout, and wait for it again.
+          (unless started
+            (delete-process process)))
+        (progress-reporter-done reporter)
         (or (nsenter--environment-find-pid command)
             (signal 'nsenter-environment-unavailable
                     (list environment
-                          (with-current-buffer (process-buffer process)
-                            (buffer-string)))))))))
+                          (nsenter--environment-output process))))))))
 
 (defun nsenter--environment-of-pid (pid)
   "Return the environment whose process inside has host pid PID."
