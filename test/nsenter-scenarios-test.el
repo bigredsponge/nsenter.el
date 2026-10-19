@@ -159,4 +159,19 @@
     (nsenter-test-in-directory
       (should (listp (directory-files nsenter-test-directory t))))))
 
+(ert-deftest nsenter-test-non-essential ()
+  "With `non-essential', operations do not start an environment."
+  (let ((nsenter-environments (cons '("stopped" :enter ("false"))
+                                    nsenter-environments))
+        (non-essential t))
+    (should-not (file-exists-p "/ns:stopped:/etc"))
+    (should-not (get-process "nsenter stopped"))))
+
+(ert-deftest nsenter-test-environment-fails-to-start ()
+  "An environment that fails to start signals its own error."
+  (let ((nsenter-environments (cons '("broken" :enter ("false"))
+                                    nsenter-environments)))
+    (should-error (file-exists-p "/ns:broken:/etc")
+                  :type 'nsenter-environment-unavailable)))
+
 ;;; nsenter-scenarios-test.el ends here
