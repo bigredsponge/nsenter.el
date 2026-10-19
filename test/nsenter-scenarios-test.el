@@ -150,7 +150,14 @@
     (should (equal (try-completion "/ns:" #'read-file-name-internal)
                    "/ns:test:"))
     (should (member "usr/" (all-completions "/ns:test:/u"
-                                            #'read-file-name-internal)))))
+                                            #'read-file-name-internal)))
+    ;; An empty path is the home directory, so /ns:test: lists it.
+    (should (equal (sort (all-completions "/ns:test:"
+                                          #'read-file-name-internal)
+                         #'string<)
+                   (sort (file-name-all-completions
+                          "" (nsenter--translate-to-host "/ns:test:~/"))
+                         #'string<)))))
 
 (ert-deftest nsenter-test-unstarted-environment ()
   "A configured environment that has not started does not break results."

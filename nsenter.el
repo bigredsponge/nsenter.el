@@ -335,6 +335,18 @@ A NAME absolute on its own, like /etc/hosts, stays a name of the host."
   (concat (match-string 0 directory)
           (directory-file-name (substring directory (match-end 0)))))
 
+(defun nsenter--file-name-directory (file)
+  "Like `file-name-directory' for FILE.
+Raw, the directory of /ns:NAME: would be /, as /ns:NAME: has no slash."
+  (string-match nsenter--environment-prefix-regexp file)
+  (concat (match-string 0 file)
+          (file-name-directory (substring file (match-end 0)))))
+
+(defun nsenter--file-name-nondirectory (file)
+  "Like `file-name-nondirectory' for FILE."
+  (string-match nsenter--environment-prefix-regexp file)
+  (file-name-nondirectory (substring file (match-end 0))))
+
 (defun nsenter--file-remote-p (file &optional identification connected)
   "Like `file-remote-p' for FILE, IDENTIFICATION and CONNECTED."
   (pcase-let ((`(,environment . ,path) (nsenter--split-name file)))
@@ -506,6 +518,8 @@ Emacs's own would run the shell on the host; TRAMP's runs it through
 (defconst nsenter--custom-operations
   '((expand-file-name . nsenter--expand-file-name)
     (directory-file-name . nsenter--directory-file-name)
+    (file-name-directory . nsenter--file-name-directory)
+    (file-name-nondirectory . nsenter--file-name-nondirectory)
     (file-remote-p . nsenter--file-remote-p)
     (file-truename . nsenter--file-truename)
     (unhandled-file-name-directory . nsenter--translate-to-host)
@@ -544,9 +558,8 @@ Their results are translated back.")
 (defconst nsenter--raw-operations
   '(abbreviate-file-name byte-compiler-base-file-name diff-latest-backup-file
     dired-compress-file file-equal-p file-group-gid file-in-directory-p
-    file-name-as-directory file-name-directory file-name-nondirectory
-    file-name-sans-versions file-notify-rm-watch file-notify-valid-p
-    file-user-uid get-file-buffer list-system-processes
+    file-name-as-directory file-name-sans-versions file-notify-rm-watch
+    file-notify-valid-p file-user-uid get-file-buffer list-system-processes
     make-auto-save-file-name make-directory-internal make-nearby-temp-file
     memory-info process-attributes substitute-in-file-name vc-registered)
   "Operations that need no translation.
