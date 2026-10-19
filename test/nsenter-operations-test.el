@@ -170,10 +170,17 @@ BODY runs in a fixture, and sees its two names as NS and HOST, see
 
 (nsenter-test-operation file-name-directory
   (should (equal (file-name-directory (concat ns "sub/b.txt"))
-                 (concat ns "sub/"))))
+                 (concat ns "sub/")))
+  ;; Without a path, the directory stays the environment's root.
+  (should (equal (file-name-directory "/ns:test:") "/ns:test:"))
+  (should (equal (file-name-directory "/ns:test:/") "/ns:test:/"))
+  (should (equal (file-name-directory "/ns:test:foo") "/ns:test:")))
 
 (nsenter-test-operation file-name-nondirectory
-  (should (equal (file-name-nondirectory (concat ns "sub/b.txt")) "b.txt")))
+  (should (equal (file-name-nondirectory (concat ns "sub/b.txt")) "b.txt"))
+  (should (equal (file-name-nondirectory "/ns:test:") ""))
+  (should (equal (file-name-nondirectory "/ns:test:/") ""))
+  (should (equal (file-name-nondirectory "/ns:test:foo") "foo")))
 
 (nsenter-test-operation file-name-sans-versions
   (should (equal (file-name-sans-versions (concat ns "a.txt~"))
