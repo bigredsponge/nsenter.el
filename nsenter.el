@@ -157,7 +157,9 @@ inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
                                (list environment)))
           (while (and (process-live-p process)
                       (not (nsenter--environment-started-p process line)))
-            (accept-process-output process)))
+            ;; Without a timeout, Emacs warns of a blocking call whenever a
+            ;; timer opens a file, as timers inhibit quitting.
+            (accept-process-output process 0.1)))
         (or (nsenter--environment-find-pid command)
             (signal 'nsenter-environment-unavailable
                     (list environment
