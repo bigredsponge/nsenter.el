@@ -99,6 +99,17 @@
                            (nsenter-test-in-directory
                              (shell-command-to-string "echo $HOME"))))))))
 
+(ert-deftest nsenter-test-relative-to-home ()
+  "In /ns:test:FILE, a relative FILE is in the home inside the environment."
+  (let ((home (expand-file-name "/ns:test:~/")))
+    (should (equal (expand-file-name "/ns:test:file.txt")
+                   (concat home "file.txt")))
+    (let ((buffer (find-file-noselect "/ns:test:file.txt")))
+      (unwind-protect
+          (with-current-buffer buffer
+            (should (equal default-directory home)))
+        (kill-buffer buffer)))))
+
 (ert-deftest nsenter-test-terminal ()
   "A shell on a pty gets job control, ^C, window sizes and its exit status."
   (nsenter-test-in-directory
