@@ -30,8 +30,8 @@ inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
 
 ;;; Names
 
-;; A name /ns:NAME:PATH stands for PATH inside the environment NAME, where an
-;; empty PATH is the home directory, as in TRAMP.  The handler performs most
+;; A name /ns:NAME:PATH stands for PATH inside the environment NAME, where a
+;; relative PATH starts from the home directory, as in TRAMP.  The handler performs most
 ;; operations by calling Emacs again on other names, and must then keep Emacs
 ;; from handing the call straight back.  `nsenter--apply-operation-bare' does
 ;; that the way TRAMP's `tramp-run-real-handler' does: it inhibits the
@@ -48,7 +48,9 @@ inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
              (string-match nsenter--environment-prefix-regexp file))
     (cons (match-string 1 file)
           (let ((path (substring file (match-end 0))))
-            (if (string-empty-p path) "~/" path)))))
+            (if (string-match-p (rx bos (or "/" "~")) path)
+                path
+              (concat "~/" path))))))
 
 (defun nsenter--environment-prefix (environment)
   "Return /ns:ENVIRONMENT:, the start of the names inside ENVIRONMENT."
@@ -359,7 +361,7 @@ A NAME absolute on its own, like /etc/hosts, stays a name of the host."
 
 (defun nsenter--directory-file-name (directory)
   "Like `directory-file-name' for DIRECTORY."
-  ;; Not `nsenter--split-name', which reads an empty path as ~/.
+  ;; Not `nsenter--split-name', which reads a relative path from ~/.
   (string-match nsenter--environment-prefix-regexp directory)
   (concat (match-string 0 directory)
           (directory-file-name (substring directory (match-end 0)))))
