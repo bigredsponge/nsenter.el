@@ -379,13 +379,16 @@ Raw, the directory of /ns:NAME: would be /, as /ns:NAME: has no slash."
   (file-name-nondirectory (substring file (match-end 0))))
 
 (defun nsenter--substitute-in-file-name (file)
-  "Like `substitute-in-file-name' for FILE.
-Raw, a // or ~/ would drop /ns:NAME:, and leave a name of the host.  A name
-that starts again with a remote prefix, like //ssh:host:/, stays that name."
+  "Like `substitute-in-file-name' for FILE, as TRAMP's own.
+Raw, a // or ~/ would drop /ns:NAME:.  As in TRAMP, // and ~/ start again
+inside, and only /// or //~ leave for the host."
   (string-match nsenter--environment-prefix-regexp file)
   (let* ((prefix (match-string 0 file))
-         (path (substitute-in-file-name (substring file (match-end 0)))))
-    (if (file-remote-p path) path (concat prefix path))))
+         (path (substring file (match-end 0)))
+         (substituted (substitute-in-file-name path)))
+    (if (string-match-p (rx "//" (in "/~")) path)
+        substituted
+      (concat prefix substituted))))
 
 (defun nsenter--file-remote-p (file &optional identification connected)
   "Like `file-remote-p' for FILE, IDENTIFICATION and CONNECTED."

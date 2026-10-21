@@ -139,16 +139,15 @@ BODY runs in a fixture, and sees its two names as NS and HOST, see
   (let ((process-environment (cons "NSENTER_TEST=zz" process-environment)))
     (should (equal (substitute-in-file-name (concat ns "$NSENTER_TEST"))
                    (concat ns "zz"))))
-  ;; As in the minibuffer, // and ~/ start again inside the environment...
+  ;; As in TRAMP, // and ~/ start again inside...
   (should (equal (substitute-in-file-name (concat ns "/bin/sh"))
                  "/ns:test:/bin/sh"))
   (should (equal (substitute-in-file-name (concat ns "~/x"))
                  "/ns:test:~/x"))
-  ;; ...unless another remote name follows.
-  (should (equal (substitute-in-file-name (concat ns "/ns:other:/x"))
-                 "/ns:other:/x"))
-  (should (equal (substitute-in-file-name (concat ns "/ssh:host:/x"))
-                 "/ssh:host:/x")))
+  ;; ...and /// or //~ on the host.
+  (should (equal (substitute-in-file-name (concat ns "//etc/hosts"))
+                 "/etc/hosts"))
+  (should (equal (substitute-in-file-name (concat ns "/~/x")) "~/x")))
 
 (nsenter-test-operation file-remote-p
   (should (equal (file-remote-p ns) "/ns:test:"))
