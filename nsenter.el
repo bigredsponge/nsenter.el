@@ -378,6 +378,15 @@ Raw, the directory of /ns:NAME: would be /, as /ns:NAME: has no slash."
   (string-match nsenter--environment-prefix-regexp file)
   (file-name-nondirectory (substring file (match-end 0))))
 
+(defun nsenter--substitute-in-file-name (file)
+  "Like `substitute-in-file-name' for FILE.
+Raw, a // or ~/ would drop /ns:NAME:, and leave a name of the host.  A name
+that starts again with a remote prefix, like //ssh:host:/, stays that name."
+  (string-match nsenter--environment-prefix-regexp file)
+  (let* ((prefix (match-string 0 file))
+         (path (substitute-in-file-name (substring file (match-end 0)))))
+    (if (file-remote-p path) path (concat prefix path))))
+
 (defun nsenter--file-remote-p (file &optional identification connected)
   "Like `file-remote-p' for FILE, IDENTIFICATION and CONNECTED."
   (pcase-let ((`(,environment . ,path) (nsenter--split-name file)))
@@ -551,6 +560,7 @@ Emacs's own would run the shell on the host; TRAMP's runs it through
     (directory-file-name . nsenter--directory-file-name)
     (file-name-directory . nsenter--file-name-directory)
     (file-name-nondirectory . nsenter--file-name-nondirectory)
+    (substitute-in-file-name . nsenter--substitute-in-file-name)
     (file-remote-p . nsenter--file-remote-p)
     (file-truename . nsenter--file-truename)
     (unhandled-file-name-directory . nsenter--translate-to-host)
@@ -592,7 +602,7 @@ Their results are translated back.")
     file-name-as-directory file-name-sans-versions file-notify-rm-watch
     file-notify-valid-p file-user-uid get-file-buffer list-system-processes
     make-auto-save-file-name make-directory-internal make-nearby-temp-file
-    memory-info process-attributes substitute-in-file-name vc-registered)
+    memory-info process-attributes vc-registered)
   "Operations that need no translation.
 They only take names apart, or ask about the host.")
 
