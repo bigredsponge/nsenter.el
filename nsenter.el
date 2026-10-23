@@ -117,8 +117,14 @@ inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
 (defun nsenter--environment-process (environment)
   "Return the live process inside ENVIRONMENT, starting the process if needed."
   (let* ((name (nsenter--environment-process-name environment))
-         (old (get-process name)))
-    (if (process-live-p old)
+         (old (get-process name))
+         (settings (alist-get environment nsenter-environments
+                              nil nil #'equal))
+         (enter (plist-get settings :enter)))
+    ;; A process started with other settings enters the environment as it
+    ;; was before `nsenter-environments' changed.
+    (if (and (process-live-p old)
+             (equal enter (process-get old 'nsenter-enter)))
         old
       ;; A dead process keeps its name, and `make-process' would then pick
       ;; another one, like "nsenter box<2>".
@@ -127,10 +133,7 @@ inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
       ;; wait for connections.
       (when non-essential
         (throw 'nsenter-non-essential 'nsenter-non-essential))
-      (let* ((settings (alist-get environment nsenter-environments
-                                  nil nil #'equal))
-             (enter (plist-get settings :enter))
-             (process-command
+      (let* ((process-command
               (nsenter--environment-process-command environment))
              (default-directory (expand-file-name "~/"))
              (process (make-process
@@ -140,6 +143,7 @@ inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
                        :connection-type 'pipe
                        :noquery t)))
         (process-put process 'nsenter-environment environment)
+        (process-put process 'nsenter-enter enter)
         process))))
 
 (defun nsenter--environment-connected-p (environment)
@@ -165,35 +169,38 @@ inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
              (line (car (last command)))
              (reporter (make-progress-reporter
                         (format "Entering %s..." environment)))
-             (started nil))
+             (pid nil))
         (unwind-protect
-            (with-timeout (nsenter-start-timeout
-                           (signal 'nsenter-environment-unavailable
-                                   (list environment
-                                         (nsenter--environment-output
-                                          process))))
-              (while (and (process-live-p process)
-                          (not (setq started (nsenter--environment-started-p
-                                              process line))))
-                ;; Without a timeout, Emacs warns of a blocking call whenever
-                ;; a timer opens a file, as timers inhibit quitting.
-                (accept-process-output process 0.1)
-                ;; The :enter command may print its own progress first, or
-                ;; wait for an answer that it asks for, which shows here.
-                (progress-reporter-update
-                 reporter nil (nsenter--environment-last-line process))
-                ;; Emacs would not show it while a command, like `find-file'
-                ;; checking its minibuffer, keeps running.
-                (redisplay)))
+            (progn
+              (with-timeout (nsenter-start-timeout
+                             (signal 'nsenter-environment-unavailable
+                                     (list environment
+                                           (nsenter--environment-output
+                                            process))))
+                (while (and (process-live-p process)
+                            (not (nsenter--environment-started-p process line)))
+                  ;; Without a timeout, Emacs warns of a blocking call
+                  ;; whenever a timer opens a file, as timers inhibit
+                  ;; quitting.
+                  (accept-process-output process 0.1)
+                  ;; The :enter command may print its own progress first, or
+                  ;; wait for an answer that it asks for, which shows here.
+                  (progress-reporter-update
+                   reporter nil (nsenter--environment-last-line process))
+                  ;; Emacs would not show it while a command, like
+                  ;; `find-file' checking its minibuffer, keeps running.
+                  (redisplay)))
+              (progress-reporter-done reporter)
+              (setq pid (nsenter--environment-find-pid command))
+              (or pid
+                  (signal 'nsenter-environment-unavailable
+                          (list environment
+                                (nsenter--environment-output process)))))
           ;; Otherwise `nsenter--environment-process' would find a process
-          ;; stuck after a quit or the timeout, and wait for it again.
-          (unless started
-            (delete-process process)))
-        (progress-reporter-done reporter)
-        (or (nsenter--environment-find-pid command)
-            (signal 'nsenter-environment-unavailable
-                    (list environment
-                          (nsenter--environment-output process))))))))
+          ;; stuck after a quit or the timeout, or one whose pid it cannot
+          ;; find, and reuse it rather than start the environment again.
+          (unless pid
+            (delete-process process)))))))
 
 (defun nsenter--environment-of-pid (pid)
   "Return the environment whose process inside has host pid PID."

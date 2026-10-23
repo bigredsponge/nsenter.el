@@ -222,4 +222,23 @@ starts the environment again rather than waiting for the stuck one."
     (should (string-search "Create it now?" (nth 2 err)))
     (should-not (process-live-p (get-process "nsenter stuck")))))
 
+(ert-deftest nsenter-test-environment-lost ()
+  "An environment whose process inside cannot be found stops.
+The next attempt starts the environment again rather than reusing it."
+  (let ((nsenter-environments (nsenter-test-environment-running "lost" "true")))
+    (cl-letf (((symbol-function 'nsenter--environment-find-pid) #'ignore))
+      (should-error (file-exists-p "/ns:lost:/etc")
+                    :type 'nsenter-environment-unavailable))
+    (should-not (process-live-p (get-process "nsenter lost")))))
+
+(ert-deftest nsenter-test-environment-changed ()
+  "Changing how an environment is entered takes effect without restarting."
+  (let ((nsenter-environments
+         (nsenter-test-environment-running "changed" "true")))
+    (let ((default-directory "/ns:changed:/"))
+      (should-not (executable-find nsenter-test-marker t))
+      (setf (alist-get "changed" nsenter-environments nil nil #'equal)
+            (alist-get "test" nsenter-environments nil nil #'equal))
+      (should (executable-find nsenter-test-marker t)))))
+
 ;;; nsenter-scenarios-test.el ends here
