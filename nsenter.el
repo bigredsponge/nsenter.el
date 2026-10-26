@@ -1,684 +1,271 @@
-;;; nsenter.el --- Fast access to your Linux namespaces -*- lexical-binding: t; -*-
+;;; nsenter.el --- Local namespace access through TRAMP -*- lexical-binding: t; -*-
 
-;; Package-Requires: ((emacs "29.1"))
+;; Version: 0.1
+;; Package-Requires: ((emacs "30.1"))
+;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
-
-;; See README.md.
+;; Configure `nsenter-environments', then visit /ns:NAME:/path.
+;; Linux /proc and util-linux nsenter with --wdns are required.
+;; File access uses the host's credentials; programs retain those credentials.
 
 ;;; Code:
 
-(require 'subr-x)
+(require 'tramp)
+(require 'cl-lib)
 
-;;; Options
-
-(defgroup nsenter nil
-  "Fast access to your Linux namespaces."
-  :group 'processes)
+(defgroup nsenter nil "Local namespace environments." :group 'tramp)
 
 (defcustom nsenter-environments nil
-  "Alist of (NAME :enter COMMAND), the environments that /ns:NAME: names.
-COMMAND is prepended to the desired command so that the desired command runs
-inside the namespace, for example \(\"distrobox\" \"enter\" \"mybox\" \"--\")."
+  "Alist of (NAME :enter (PROGRAM ARG...)) environment definitions.
+The command prefix must run its remaining arguments inside the environment,
+with stdin open, without allocating a terminal.  Optional :timeout overrides
+`nsenter-start-timeout' for this environment.  For example:
+  ((\"box\" :enter (\"podman\" \"exec\" \"-i\" \"box\")))"
   :type '(alist :key-type string :value-type plist)
   :group 'nsenter)
 
 (defcustom nsenter-start-timeout 120
-  "Seconds to wait for the process inside an environment to start."
+  "Seconds to wait for an environment to start."
   :type 'number
   :group 'nsenter)
 
-;;; Names
-
-;; A name /ns:NAME:PATH stands for PATH inside the environment NAME, where a
-;; relative PATH starts from the home directory, as in TRAMP.  The handler performs most
-;; operations by calling Emacs again on other names, and must then keep Emacs
-;; from handing the call straight back.  `nsenter--apply-operation-bare' does
-;; that the way TRAMP's `tramp-run-real-handler' does: it inhibits the
-;; handlers for that one operation only, so that the calls the operation makes
-;; in turn still find their handlers.
-
-(defconst nsenter--environment-prefix-regexp
-  (rx bos "/ns:" (group (+ (not (in "/:|")))) ":")
-  "Matches the /ns:NAME: that starts a name, with NAME as the first group.")
-
-(defun nsenter--split-name (file)
-  "Return (NAME . PATH) for FILE, a /ns:NAME:PATH name, or nil."
-  (when (and (stringp file)
-             (string-match nsenter--environment-prefix-regexp file))
-    (cons (match-string 1 file)
-          (let ((path (substring file (match-end 0))))
-            (if (string-match-p (rx bos (or "/" "~")) path)
-                path
-              (concat "~/" path))))))
-
-(defun nsenter--environment-prefix (environment)
-  "Return /ns:ENVIRONMENT:, the start of the names inside ENVIRONMENT."
-  (concat "/ns:" environment ":"))
-
-(defun nsenter--apply-operation-bare (operation arguments)
-  "Call OPERATION with ARGUMENTS as if no file name handler matched."
-  (let ((inhibit-file-name-handlers (mapcar #'cdr file-name-handler-alist))
-        (inhibit-file-name-operation operation))
-    (apply operation arguments)))
-
-;;; Environments
-
-;; Everything rests on one process per environment: the :enter command starts
-;; "sh -c 'echo \"$0\"; read _' 'nsenter EMACS-PID NAME'" inside it, and that
-;; shell lives until Emacs exits and closes its input.  What the host needs is
-;; that process's pid, since /proc/PID/root reaches its files and nsenter joins
-;; its namespaces.  Nothing hands the pid over: the process Emacs started is
-;; the :enter command, a client such as podman exec whose child may belong to
-;; a daemon, and the shell inside sees only the pid its own namespace gives it.
-;; So the shell announces itself by printing its last argument, which is
-;; unique to this Emacs, and the host then finds the process whose command line
-;; is exactly that command.  The pid is remembered on the Emacs process, so it
-;; is found again only after the environment restarts.
-
-(define-error 'nsenter-environment-unavailable
-  "Environment did not start")
-
-(defun nsenter--environment-process-name (environment)
-  "Return the name of the Emacs process inside ENVIRONMENT."
-  (concat "nsenter " environment))
-
-(defun nsenter--environment-process-command (environment)
-  "Return the command that the process inside ENVIRONMENT runs."
-  `("sh" "-c" "echo \"$0\"; read _"
-    ,(format "nsenter %d %s" (emacs-pid) environment)))
-
-(defun nsenter--environment-started-p (process line)
-  "Return whether PROCESS has printed LINE."
-  (with-current-buffer (process-buffer process)
-    (save-excursion
-      (goto-char (point-min))
-      (search-forward (concat line "\n") nil t))))
-
-(defun nsenter--environment-cmdline (pid)
-  "Return the command line of host process PID, as bytes, or nil."
-  (ignore-errors
-    (with-temp-buffer
-      (set-buffer-multibyte nil)
-      (insert-file-contents-literally (format "/proc/%d/cmdline" pid))
-      (buffer-string))))
-
-(defun nsenter--environment-find-pid (command)
-  "Return the pid of a host process running COMMAND, or nil."
-  ;; /proc/PID/cmdline holds each argument followed by a NUL byte, see proc(5).
-  (let* ((joined (concat (string-join command "\0") "\0"))
-         (cmdline (encode-coding-string joined 'utf-8))
-         (pids (mapcar #'string-to-number
-                       (directory-files "/proc" nil "\\`[0-9]+\\'"))))
-    (seq-find (lambda (pid)
-                (equal cmdline (nsenter--environment-cmdline pid)))
-              pids)))
-
-(defun nsenter--environment-process (environment)
-  "Return the live process inside ENVIRONMENT, starting the process if needed."
-  (let* ((name (nsenter--environment-process-name environment))
-         (old (get-process name))
-         (settings (alist-get environment nsenter-environments
-                              nil nil #'equal))
-         (enter (plist-get settings :enter)))
-    ;; A process started with other settings enters the environment as it
-    ;; was before `nsenter-environments' changed.
-    (if (and (process-live-p old)
-             (equal enter (process-get old 'nsenter-enter)))
-        old
-      ;; A dead process keeps its name, and `make-process' would then pick
-      ;; another one, like "nsenter box<2>".
-      (when old (delete-process old))
-      ;; Background code, like saveplace, binds `non-essential' so as not to
-      ;; wait for connections.
-      (when non-essential
-        (throw 'nsenter-non-essential 'nsenter-non-essential))
-      (let* ((process-command
-              (nsenter--environment-process-command environment))
-             (default-directory (expand-file-name "~/"))
-             (process (make-process
-                       :name name
-                       :buffer (generate-new-buffer (concat " *" name "*"))
-                       :command (append enter process-command)
-                       :connection-type 'pipe
-                       :noquery t)))
-        (process-put process 'nsenter-environment environment)
-        (process-put process 'nsenter-enter enter)
-        process))))
-
-(defun nsenter--environment-connected-p (environment)
-  "Return whether the process inside ENVIRONMENT runs."
-  (process-live-p
-   (get-process (nsenter--environment-process-name environment))))
-
-(defun nsenter--environment-output (process)
-  "Return what PROCESS has printed."
-  (with-current-buffer (process-buffer process)
+(defun nsenter--read (file)
+  "Read FILE literally."
+  (with-temp-buffer
+    (insert-file-contents-literally file)
     (buffer-string)))
 
-(defun nsenter--environment-last-line (process)
-  "Return the last line that PROCESS has printed, or nil."
-  (car (last (split-string (nsenter--environment-output process) "\n" t
-                           "[[:space:]]+"))))
+(defun nsenter--connection (vec)
+  "Return the live environment process for VEC, starting it if needed."
+  (or (let ((p (tramp-get-connection-process vec)))
+        (and p (process-live-p p) (process-get p 'nsenter-pid) p))
+      (progn
+        (unless (tramp-connectable-p vec)
+          (throw 'non-essential 'non-essential))
+        (let* ((entry (assoc (tramp-file-name-host vec) nsenter-environments))
+               (prefix (plist-get (cdr entry) :enter))
+               (marker (concat "nsenter-" (make-temp-name "")))
+               (command (list "sh" "-c" "read _" marker))
+               (expected (concat (mapconcat #'identity command "\0") "\0"))
+               (default-directory "/")
+               (deadline (+ (float-time) (or (plist-get (cdr entry) :timeout)
+                                            nsenter-start-timeout)))
+               (reporter (make-progress-reporter
+                          (format "Entering %s..." (car entry))))
+               p pid)
+          (unless prefix (error "No :enter command for %s" (car entry)))
+          (setq p (make-process
+                   :name (tramp-get-connection-name vec)
+                   :buffer (tramp-get-connection-buffer vec)
+                   :command (append prefix command)
+                   :connection-type 'pipe :noquery t))
+          (unwind-protect
+              (progn
+                (while (and (not pid) (process-live-p p)
+                            (< (float-time) deadline))
+                  (dolist (dir (directory-files "/proc" t "\\`[0-9]+\\'"))
+                    (when (equal (ignore-errors
+                                   (nsenter--read (concat dir "/cmdline")))
+                                 expected)
+                      (setq pid (string-to-number (file-name-nondirectory dir)))))
+                  (unless pid
+                    (accept-process-output p 0.02)
+                    (progress-reporter-update
+                     reporter nil (with-current-buffer (process-buffer p)
+                                    (car (last (split-string (buffer-string) "\n" t)))))
+                    (redisplay)))
+                (unless pid
+                  (error "Environment did not start: %s"
+                         (with-current-buffer (process-buffer p) (buffer-string))))
+                (process-put p 'nsenter-pid pid)
+                (process-put p 'nsenter-environment
+                             (split-string
+                              (nsenter--read (format "/proc/%d/environ" pid))
+                              "\0" t))
+                (tramp-post-process-creation p vec)
+                (tramp-set-connection-property p "connected" t)
+                (tramp-set-connection-local-variables vec)
+                (progress-reporter-done reporter)
+                p)
+            (unless (process-get p 'nsenter-pid) (delete-process p)))))))
 
-(defun nsenter--environment-pid (environment)
-  "Return the host pid of the process inside ENVIRONMENT."
-  (let ((process (nsenter--environment-process environment)))
-    (with-memoization (process-get process 'nsenter-pid)
-      (let* ((command (nsenter--environment-process-command environment))
-             (line (car (last command)))
-             (reporter (make-progress-reporter
-                        (format "Entering %s..." environment)))
-             (pid nil))
-        (unwind-protect
-            (progn
-              (with-timeout (nsenter-start-timeout
-                             (signal 'nsenter-environment-unavailable
-                                     (list environment
-                                           (nsenter--environment-output
-                                            process))))
-                (while (and (process-live-p process)
-                            (not (nsenter--environment-started-p process line)))
-                  ;; Without a timeout, Emacs warns of a blocking call
-                  ;; whenever a timer opens a file, as timers inhibit
-                  ;; quitting.
-                  (accept-process-output process 0.1)
-                  ;; The :enter command may print its own progress first, or
-                  ;; wait for an answer that it asks for, which shows here.
-                  (progress-reporter-update
-                   reporter nil (nsenter--environment-last-line process))
-                  ;; Emacs would not show it while a command, like
-                  ;; `find-file' checking its minibuffer, keeps running.
-                  (redisplay)))
-              (progress-reporter-done reporter)
-              (setq pid (nsenter--environment-find-pid command))
-              (or pid
-                  (signal 'nsenter-environment-unavailable
-                          (list environment
-                                (nsenter--environment-output process)))))
-          ;; Otherwise `nsenter--environment-process' would find a process
-          ;; stuck after a quit or the timeout, or one whose pid it cannot
-          ;; find, and reuse it rather than start the environment again.
-          (unless pid
-            (delete-process process)))))))
+(defun nsenter--resolve (root path &optional nofollow)
+  "Resolve PATH within ROOT, following links component by component.
+Absolute link targets restart at ROOT; .. cannot escape it.
+With NOFOLLOW, leave the final component unresolved."
+  (let ((todo (split-string path "/" t)) done (links 0))
+    (while todo
+      (let ((part (pop todo)))
+        (cond
+         ((equal part "."))
+         ((equal part "..") (pop done))
+         (t
+          (let* ((candidate (concat root "/"
+                                    (mapconcat #'identity
+                                               (reverse (cons part done)) "/")))
+                 (target (unless (and nofollow (null todo))
+                           (file-symlink-p candidate))))
+            (if (not target) (push part done)
+              (when (> (cl-incf links) 40)
+                (signal 'file-error (list "Too many symbolic links" path)))
+              (when (string-prefix-p "/" target) (setq done nil))
+              (setq todo (append (split-string target "/" t) todo))))))))
+    (concat root "/" (mapconcat #'identity (reverse done) "/")
+            (when (and done (not nofollow) (string-suffix-p "/" path)) "/"))))
 
-(defun nsenter--environment-of-pid (pid)
-  "Return the environment whose process inside has host pid PID."
-  (seq-some (lambda (process)
-              (and (eql (process-get process 'nsenter-pid) pid)
-                   (process-get process 'nsenter-environment)))
-            (process-list)))
+(defun nsenter--local (file &optional nofollow)
+  "Translate an ns FILE to a host path, optionally with NOFOLLOW."
+  (if (not (nsenter--file-name-p file)) file
+    (let* ((vec (tramp-dissect-file-name file))
+           (p (nsenter--connection vec)))
+      (nsenter--resolve
+       (format "/proc/%d/root" (process-get p 'nsenter-pid))
+       (file-name-unquote (tramp-file-name-localname vec)) nofollow))))
 
-(defun nsenter--environment-variables (environment current initial)
-  "Return the variables for programs inside ENVIRONMENT.
-Those are the variables of the process inside, which entering produced, plus
-what CURRENT adds to INITIAL, both lists like `process-environment'.  PATH
-stays the one inside, where the programs are, and PWD is left out, since the
-directory inside differs from the one in Emacs."
-  (let* ((pid (nsenter--environment-pid environment))
-         (environ (format "/proc/%d/environ" pid))
-         (contents (with-temp-buffer
-                     (insert-file-contents-literally environ)
-                     (buffer-string)))
-         (inside (split-string contents "\0" t))
-         (changed (seq-difference current initial))
-         (changed-but-path (seq-remove (lambda (variable)
-                                         (string-prefix-p "PATH=" variable))
-                                       changed)))
-    (seq-remove (lambda (variable) (string-prefix-p "PWD=" variable))
-                (append changed-but-path inside))))
+(defun nsenter--file-operation (operation &rest args)
+  "Run file OPERATION on translated ARGS."
+  (let ((nofollow (memq operation '(file-attributes delete-file delete-directory
+                                  rename-file make-directory))))
+    (setcar args (nsenter--local (car args) nofollow))
+    (when (memq operation '(copy-file rename-file add-name-to-file))
+      (setcar (cdr args) (nsenter--local (cadr args) t)))
+    (apply operation args)))
 
-(defun nsenter--environment-program-command
-    (environment directory program arguments)
-  "Return the nsenter command that runs PROGRAM with ARGUMENTS in ENVIRONMENT.
-DIRECTORY is the working directory inside.  The command itself starts on the
-host, so run it from a directory of the host."
-  (let* ((pid (number-to-string (nsenter--environment-pid environment)))
-         ;; setns(2) fails with EINVAL for the user namespace the caller is
-         ;; already in, as when the environment shares the host's; the links
-         ;; name their namespace, like "user:[4026531837]".
-         (own-user-namespace
-          (equal (file-symlink-p (format "/proc/%s/ns/user" pid))
-                 (file-symlink-p "/proc/self/ns/user"))))
-    `("nsenter" "-t" ,pid "-m" "-r" "--preserve-credentials"
-      ;; --wd would name the directory as the host sees it, --wdns as the
-      ;; target's mount namespace does, see nsenter(1).
-      ,(concat "--wdns=" directory)
-      ,@(unless own-user-namespace '("-U"))
-      "--"
-      ,(or (cdr (nsenter--split-name program)) program)
-      ,@arguments)))
-
-(defun nsenter--environment-home (environment user)
-  "Return the home of USER inside ENVIRONMENT, as a shell there expands ~USER.
-An empty USER is the user inside, as for ~ alone."
-  ;; USER goes into a shell command, so it must not hold anything but a name.
-  (unless (string-match-p (rx bos (* (in alnum "._-")) eos) user)
-    (error "Cannot expand tilde for user `%s'" user))
-  (let ((process (nsenter--environment-process environment)))
-    (with-memoization (alist-get user (process-get process 'nsenter-homes)
-                                 nil nil #'equal)
-      (let* ((echo (list "-c" (concat "echo ~" user)))
-             (command (nsenter--environment-program-command
-                       environment "/" "sh" echo))
-             (process-environment
-              (nsenter--environment-variables
-               environment process-environment initial-environment))
-             (default-directory temporary-file-directory)
-             (output (with-temp-buffer
-                       (apply #'call-process (car command) nil '(t nil) nil
-                              (cdr command))
-                       (buffer-string)))
-             (home (string-trim-right output)))
-        ;; A shell prints ~USER back unchanged for a user it does not know.
-        (unless (file-name-absolute-p home)
-          (error "Cannot expand tilde for user `%s'" user))
-        home))))
-
-;;; Host names
-
-;; The host reaches /path inside an environment as /proc/PID/root/path, so
-;; most operations only need that name.  Symbolic links are the catch.  A
-;; relative link resolves the same way from either side, but an absolute one
-;; does not: if /proc/PID/root/etc/hosts links to /run/hosts, following it on
-;; the host leads to the host's own /run/hosts.  So translation resolves links
-;; itself, running `file-truename' with a handler that answers
-;; `file-symlink-p' as the host does, except that it puts absolute targets
-;; under /proc/PID/root, and says /proc/PID/root itself is no link, since it
-;; links to the host's root.  The way back looks up which environment has the
-;; pid in /proc/PID/root.
-
-(defun nsenter--inside-path (environment path)
-  "Return PATH, a path inside ENVIRONMENT, made absolute."
-  (pcase path
-    ((rx bos "~" (let user (* (not "/"))) (let rest (* anything)))
-     (nsenter--inside-path
-      environment (concat (nsenter--environment-home environment user) rest)))
-    (_ (nsenter--apply-operation-bare 'expand-file-name (list path "/")))))
-
-(defun nsenter--translate-symlink-handler (root)
-  "Return a file name handler that keeps symlinks under ROOT inside ROOT."
-  (lambda (operation &rest arguments)
-    (let ((bare (nsenter--apply-operation-bare operation arguments)))
-      (cond ((not (eq operation 'file-symlink-p)) bare)
-            ((equal (directory-file-name (car arguments)) root) nil)
-            ((and bare (file-name-absolute-p bare)) (concat root bare))
-            (t bare)))))
-
-(defun nsenter--translate-to-host (file &optional nofollow)
-  "Return the host name of FILE, a /ns: name, or FILE itself.
-With NOFOLLOW, do not follow a symlink at the end of FILE."
-  (pcase (nsenter--split-name file)
-    (`(,environment . ,path)
-     (let* ((pid (nsenter--environment-pid environment))
-            (root (format "/proc/%d/root" pid))
-            (inside (nsenter--inside-path environment path))
-            (host-file (concat root inside))
-            (under-root (rx bos (literal root) (or "/" eos)))
-            (handler (nsenter--translate-symlink-handler root))
-            (file-name-handler-alist (list (cons under-root handler))))
-       (if nofollow
-           (concat (file-truename (file-name-directory host-file))
-                   (file-name-nondirectory host-file))
-         (file-truename host-file))))
-    (_ file)))
-
-(defun nsenter--translate-from-host (value)
-  "Return VALUE with each host name in VALUE as a /ns: name again.
-VALUE is the result of an operation: a name, a list of names, as from
-`directory-files', or lists within lists, as from
-`directory-files-and-attributes'."
-  (pcase value
-    ((pred consp) (cons (nsenter--translate-from-host (car value))
-                        (nsenter--translate-from-host (cdr value))))
-    ((rx bos "/proc/" (let pid (+ digit)) "/root"
-         (let rest (or (seq "/" (* anything)) eos)))
-     (if-let* ((environment (nsenter--environment-of-pid
-                             (string-to-number pid))))
-         (concat (nsenter--environment-prefix environment) rest)
-       value))
-    (_ value)))
-
-;;; Custom operations
-
-;; The operations that `nsenter--handler' cannot route by table.  Each one is
-;; named after the Emacs operation it stands in for.
-
-;;;; Names
-
-;; These work on names alone.  Translated, they would answer with host names;
-;; raw, they would treat /ns:NAME: as part of an ordinary path.
-
-(defun nsenter--expand-file-name (name &optional directory)
-  "Like `expand-file-name' for NAME in DIRECTORY.
-A NAME absolute on its own, like /etc/hosts, stays a name of the host."
-  (let ((absolute (if (file-name-absolute-p name)
-                      name
-                    (concat (file-name-as-directory
-                             (or directory default-directory))
-                            name))))
-    (pcase (nsenter--split-name absolute)
-      (`(,environment . ,path)
-       (concat (nsenter--environment-prefix environment)
-               (nsenter--inside-path environment path)))
-      ;; `expand-file-name' also consults the handler of `default-directory',
-      ;; which would be this one again.
-      (_ (let ((file-name-handler-alist nil))
-           (expand-file-name absolute))))))
-
-(defun nsenter--directory-file-name (directory)
-  "Like `directory-file-name' for DIRECTORY."
-  ;; Not `nsenter--split-name', which reads a relative path from ~/.
-  (string-match nsenter--environment-prefix-regexp directory)
-  (concat (match-string 0 directory)
-          (directory-file-name (substring directory (match-end 0)))))
-
-(defun nsenter--file-name-directory (file)
-  "Like `file-name-directory' for FILE.
-Raw, the directory of /ns:NAME: would be /, as /ns:NAME: has no slash."
-  (string-match nsenter--environment-prefix-regexp file)
-  (concat (match-string 0 file)
-          (file-name-directory (substring file (match-end 0)))))
-
-(defun nsenter--file-name-nondirectory (file)
-  "Like `file-name-nondirectory' for FILE."
-  (string-match nsenter--environment-prefix-regexp file)
-  (file-name-nondirectory (substring file (match-end 0))))
-
-(defun nsenter--substitute-in-file-name (file)
-  "Like `substitute-in-file-name' for FILE, as TRAMP's own.
-Raw, a // or ~/ would drop /ns:NAME:.  As in TRAMP, // and ~/ start again
-inside, and only /// or //~ leave for the host."
-  (string-match nsenter--environment-prefix-regexp file)
-  (let* ((prefix (match-string 0 file))
-         (path (substring file (match-end 0)))
-         (substituted (substitute-in-file-name path)))
-    (if (string-match-p (rx "//" (in "/~")) path)
-        substituted
-      (concat prefix substituted))))
-
-(defun nsenter--file-remote-p (file &optional identification connected)
-  "Like `file-remote-p' for FILE, IDENTIFICATION and CONNECTED."
-  (pcase-let ((`(,environment . ,path) (nsenter--split-name file)))
-    (when (or (not connected) (nsenter--environment-connected-p environment))
-      (pcase identification
-        ('method "ns")
-        ('host environment)
-        ('localname path)
-        ((or 'user 'hop) nil)
-        (_ (nsenter--environment-prefix environment))))))
-
-(defun nsenter--file-truename (file)
-  "Like `file-truename' for FILE.
-Translated, the host's `file-truename' would follow /proc/PID/root out to /."
-  (nsenter--translate-from-host
-   (nsenter--translate-to-host (nsenter--expand-file-name file))))
-
-;;;; Files
-
-;; These move bytes through the host's name for a file, but keep the /ns:
-;; name wherever Emacs remembers the file, as in `buffer-file-name'.
-
-(defun nsenter--insert-file-contents (file &optional visit beg end replace)
-  "Like `insert-file-contents' for FILE, VISIT, BEG, END and REPLACE.
-Translated, the buffer would visit the host name of FILE."
-  (let ((expanded (expand-file-name file)))
-    (unwind-protect
-        (cons expanded
-              (cdr (insert-file-contents (nsenter--translate-to-host expanded)
-                                         visit beg end replace)))
-      (when visit (setq buffer-file-name expanded)))))
-
-(defun nsenter--write-region
-    (start end file &optional append visit lockname mustbenew)
-  "Like `write-region' for START, END, FILE, APPEND, VISIT, LOCKNAME, MUSTBENEW.
-Translated, a VISIT of t would make the buffer visit the host name of FILE, so
-VISIT becomes FILE itself, which Emacs hands to the handler again unless the
-call skips the handlers."
-  (let ((expanded (expand-file-name file)))
-    (nsenter--apply-operation-bare
-     'write-region
-     (list start end (nsenter--translate-to-host expanded) append
-           (if (eq visit t) expanded visit) lockname mustbenew))))
-
-(defun nsenter--verify-visited-file-modtime (&optional buffer)
-  "Like `verify-visited-file-modtime' for BUFFER.
-Emacs checks the file that the variable `buffer-file-name' names, so for as
-long as it checks, that is the host name."
-  (with-current-buffer (or buffer (current-buffer))
-    (let ((buffer-file-name (nsenter--translate-to-host buffer-file-name)))
-      (verify-visited-file-modtime))))
-
-(defun nsenter--set-visited-file-modtime (&optional time)
-  "Like `set-visited-file-modtime' for TIME.
-Without TIME, Emacs reads the file that the variable `buffer-file-name' names,
-as in `nsenter--verify-visited-file-modtime'."
-  (let ((buffer-file-name (nsenter--translate-to-host buffer-file-name)))
-    (set-visited-file-modtime time)))
-
-(defun nsenter--file-local-copy (file)
-  "Like `file-local-copy' for FILE.
-Translated, the host name is already local, so the answer would be nil, which
-tells the caller to use the /ns: name itself."
-  (let ((copy (make-temp-file "nsenter-" nil (file-name-extension file t))))
-    (copy-file (nsenter--translate-to-host file) copy t 'keep-time)
-    copy))
-
-(defun nsenter--make-symbolic-link (target link &optional ok-if-already-exists)
-  "Like `make-symbolic-link' for TARGET, LINK and OK-IF-ALREADY-EXISTS.
-TARGET is the text that the link holds, which is read inside, so a TARGET in
-the environment of LINK loses its /ns: prefix."
-  (pcase-let ((`(,target-environment . ,target-path)
-               (nsenter--split-name target)))
-    (make-symbolic-link (if (equal target-environment
-                                   (car (nsenter--split-name link)))
-                            target-path
-                          target)
-                        (nsenter--translate-to-host link t)
-                        ok-if-already-exists)))
-
-(defun nsenter--temporary-file-directory ()
-  "Like the function `temporary-file-directory'.
-That is the /tmp inside, where programs inside find what Emacs puts there."
-  (pcase-let ((`(,environment . ,_) (nsenter--split-name default-directory)))
-    (concat (nsenter--environment-prefix environment) "/tmp/")))
-
-;;;; Programs
-
-;; Every program starts on the host as nsenter, which joins the namespaces of
-;; the process inside, with the variables of that process and with
-;; `default-directory' as the environment names it.  Emacs itself, though, must
-;; start nsenter from a directory of the host, which a /ns: name is not.
+(defun nsenter--completions (file directory)
+  "Return completions for FILE in DIRECTORY using TRAMP's filtering."
+  (tramp-skeleton-file-name-all-completions file directory
+    (all-completions
+     file (mapcar (lambda (name)
+                    (if (file-directory-p (concat directory name))
+                        (concat name "/") name))
+                  (directory-files (nsenter--local directory))))))
 
 (defun nsenter--exec-path ()
-  "Like the function `exec-path'.
-That is the PATH inside, then the working directory inside, which Eshell drops,
-taking the last element for the directory of Emacs, as with TRAMP."
-  (pcase-let* ((`(,environment . ,path)
-                (nsenter--split-name default-directory))
-               (variables
-                (nsenter--environment-variables
-                 environment process-environment initial-environment)))
-    (append (parse-colon-path (getenv-internal "PATH" variables))
-            (list (nsenter--inside-path environment path)))))
+  "Return the inner process's executable search path."
+  (let* ((vec (tramp-dissect-file-name default-directory))
+         (env (nsenter--environment (nsenter--connection vec))))
+    (append (split-string (getenv-internal "PATH" env) ":")
+            (list (tramp-file-name-localname vec)))))
 
-(defun nsenter--make-process (&rest arguments)
-  "Like `make-process' for ARGUMENTS."
-  (pcase-let* ((`(,environment . ,path)
-                (nsenter--split-name (expand-file-name default-directory)))
-               (`(,program . ,program-arguments) (plist-get arguments :command))
-               (inside (nsenter--inside-path environment path))
-               (command (nsenter--environment-program-command
-                         environment inside program program-arguments))
-               (process-environment
-                (nsenter--environment-variables
-                 environment process-environment initial-environment))
-               (default-directory temporary-file-directory))
-    ;; `make-process' reads the first :command, so this one wins.
-    (apply #'make-process :command command arguments)))
+(defun nsenter--insert (filename &optional visit beg end replace)
+  "Insert FILENAME, honoring VISIT, BEG, END and REPLACE."
+  (let (result)
+    (unwind-protect
+        (setq result (insert-file-contents
+                      (nsenter--local filename) visit beg end replace))
+      (when visit (setq buffer-file-name filename)))
+    (cons filename (cdr result))))
 
-(defun nsenter--start-file-process (name buffer program &rest arguments)
-  "Like `start-file-process' for NAME, BUFFER, PROGRAM and ARGUMENTS."
-  (nsenter--make-process
-   :name name :buffer buffer :command (cons program arguments)))
+(defun nsenter--write (start end filename &optional append visit lockname mustbenew)
+  "Like `write-region' for START, END, FILENAME and APPEND.
+VISIT, LOCKNAME and MUSTBENEW are as for `write-region'."
+  (tramp-skeleton-write-region start end filename append visit lockname mustbenew
+    (let (create-lockfiles)
+      (write-region start end (nsenter--local filename) append 'nomessage))
+    (setq coding-system-used last-coding-system-used)))
 
-(defun nsenter--process-file
-    (program &optional infile destination display &rest arguments)
-  "Like `process-file' for PROGRAM, INFILE, DESTINATION, DISPLAY, ARGUMENTS.
-INFILE and a file in DESTINATION are /ns: names, which the host reads and
-writes by their host names."
-  (pcase-let* ((`(,environment . ,path)
-                (nsenter--split-name (expand-file-name default-directory)))
-               (host-infile (and infile (nsenter--translate-to-host
-                                         (expand-file-name infile))))
-               (error-file (and (consp destination) (stringp (cadr destination))
-                                (cadr destination)))
-               (host-error-file
-                (and error-file (nsenter--translate-to-host
-                                 (expand-file-name error-file))))
-               (host-destination (if host-error-file
-                                     (list (car destination) host-error-file)
-                                   destination))
-               (inside (nsenter--inside-path environment path))
-               (command (nsenter--environment-program-command
-                         environment inside program arguments))
-               (process-environment
-                (nsenter--environment-variables
-                 environment process-environment initial-environment))
-               (default-directory temporary-file-directory))
-    (apply #'call-process (car command) host-infile host-destination
-           display (cdr command))))
+(defun nsenter--environment (p)
+  "Return P's inner environment plus dynamically bound variables."
+  (append (cl-remove-if
+           (lambda (entry)
+             (member entry (default-toplevel-value 'process-environment)))
+           process-environment)
+          (process-get p 'nsenter-environment)))
 
-(declare-function tramp-handle-shell-command "tramp")
+(defun nsenter--command (vec)
+  "Return the nsenter command prefix for VEC's working directory."
+  (let* ((p (nsenter--connection vec))
+         (pid (process-get p 'nsenter-pid))
+         (base (format "/proc/%d/ns/" pid))
+         (flags '(("user" . "--user") ("mnt" . "--mount")
+                  ("uts" . "--uts") ("ipc" . "--ipc") ("net" . "--net")
+                  ("pid" . "--pid") ("cgroup" . "--cgroup") ("time" . "--time"))))
+    (append (list (executable-find "nsenter") "-t" (number-to-string pid)
+                  "-r" "--preserve-credentials"
+                  (concat "--wdns=" (tramp-file-name-localname vec)))
+            (cl-loop for (name . flag) in flags
+                     unless (equal (file-symlink-p (concat base name))
+                                   (file-symlink-p (concat "/proc/self/ns/" name)))
+                     collect flag)
+            '("--"))))
 
-(defun nsenter--shell-command (command &optional output-buffer error-buffer)
-  "Like `shell-command' for COMMAND, OUTPUT-BUFFER and ERROR-BUFFER.
-Emacs's own would run the shell on the host; TRAMP's runs it through
-`process-file' and `start-file-process', and so through the handler."
-  (require 'tramp)
-  (tramp-handle-shell-command command output-buffer error-buffer))
+(defun nsenter--process-file (program &optional infile destination display &rest args)
+  "Run PROGRAM with INFILE, DESTINATION, DISPLAY and ARGS inside the environment."
+  (let* ((vec (tramp-dissect-file-name default-directory))
+         (command (nsenter--command vec))
+         (infile (and infile (nsenter--local infile)))
+         (destination (if (and (consp destination) (stringp (cadr destination)))
+                          (list (car destination) (nsenter--local (cadr destination)))
+                        destination))
+         (process-environment (nsenter--environment (nsenter--connection vec)))
+         (default-directory "/"))
+    (apply #'call-process (car command) infile destination display
+           (append (cdr command) (list program) args))))
 
-;;; Routing
+(defun nsenter--make-process (&rest args)
+  "Run an asynchronous environment process with `make-process' ARGS."
+  (let* ((vec (tramp-dissect-file-name default-directory))
+         (command (append (nsenter--command vec) (plist-get args :command)))
+         (process-environment (nsenter--environment (nsenter--connection vec)))
+         (default-directory "/")
+         (p (apply #'make-process (plist-put (copy-sequence args) :command command))))
+    (process-put p 'remote-command (plist-get args :command))
+    p))
 
-;; Emacs hands every operation on a /ns: name to `nsenter--handler', which
-;; performs it by the table that lists it.  Every operation that Emacs or
-;; TRAMP's backends know is in exactly one table, which the tests check, so an
-;; operation that newer Emacs adds signals an error rather than being guessed.
+(defun nsenter--home (vec &optional _user)
+  "Return the environment's HOME for VEC."
+  (getenv-internal "HOME" (process-get (nsenter--connection vec) 'nsenter-environment)))
 
-(defconst nsenter--custom-operations
-  '((expand-file-name . nsenter--expand-file-name)
-    (directory-file-name . nsenter--directory-file-name)
-    (file-name-directory . nsenter--file-name-directory)
-    (file-name-nondirectory . nsenter--file-name-nondirectory)
-    (substitute-in-file-name . nsenter--substitute-in-file-name)
-    (file-remote-p . nsenter--file-remote-p)
-    (file-truename . nsenter--file-truename)
-    (unhandled-file-name-directory . nsenter--translate-to-host)
-    (insert-file-contents . nsenter--insert-file-contents)
-    (write-region . nsenter--write-region)
-    (verify-visited-file-modtime . nsenter--verify-visited-file-modtime)
-    (set-visited-file-modtime . nsenter--set-visited-file-modtime)
-    (file-local-copy . nsenter--file-local-copy)
-    (make-symbolic-link . nsenter--make-symbolic-link)
-    (temporary-file-directory . nsenter--temporary-file-directory)
-    (exec-path . nsenter--exec-path)
-    (make-process . nsenter--make-process)
-    (start-file-process . nsenter--start-file-process)
-    (process-file . nsenter--process-file)
-    (shell-command . nsenter--shell-command))
-  "Operations with logic of their own, and the functions that perform them.")
+(defconst nsenter-file-name-handler-alist
+  (append
+   (mapcar (lambda (op) (cons op (intern (concat "tramp-handle-" (symbol-name op)))))
+           '(access-file copy-directory directory-file-name directory-files
+             directory-files-and-attributes dired-uncache expand-file-name
+             file-accessible-directory-p file-directory-p file-equal-p
+             file-in-directory-p file-local-copy file-locked-p file-modes
+             file-name-as-directory file-name-case-insensitive-p file-name-completion
+             file-name-directory file-name-nondirectory file-newer-than-file-p
+             file-regular-p file-remote-p file-symlink-p file-truename
+             find-backup-file-name insert-directory load lock-file
+             make-auto-save-file-name make-lock-file-name make-nearby-temp-file
+             set-visited-file-modtime shell-command start-file-process
+             substitute-in-file-name temporary-file-directory unlock-file
+             verify-visited-file-modtime))
+   (mapcar (lambda (op) (cons op #'nsenter--file-operation))
+           '(add-name-to-file copy-file delete-directory delete-file file-attributes
+             file-executable-p file-exists-p file-readable-p file-writable-p
+             file-system-info make-directory rename-file set-file-modes set-file-times))
+   '((exec-path . nsenter--exec-path)
+     (file-name-all-completions . nsenter--completions)
+     (insert-file-contents . nsenter--insert) (write-region . nsenter--write)
+     (process-file . nsenter--process-file) (make-process . nsenter--make-process)
+     (tramp-get-home-directory . nsenter--home)
+     (tramp-get-remote-uid . ignore) (tramp-get-remote-gid . ignore)
+     (tramp-set-file-uid-gid . ignore) (file-acl . ignore)
+     (file-selinux-context . tramp-handle-file-selinux-context)
+     (set-file-acl . ignore) (set-file-selinux-context . ignore)
+     (unhandled-file-name-directory . ignore) (vc-registered . ignore)))
+  "Operations handled by the ns backend.")
 
-(defconst nsenter--translated-operations
-  '(access-file add-name-to-file copy-directory copy-file delete-directory
-    delete-file directory-files directory-files-and-attributes dired-uncache
-    file-accessible-directory-p file-acl file-attributes file-directory-p
-    file-executable-p file-exists-p file-locked-p file-modes
-    file-name-all-completions file-name-case-insensitive-p file-name-completion
-    file-newer-than-file-p file-notify-add-watch file-ownership-preserved-p
-    file-readable-p file-regular-p file-selinux-context file-symlink-p
-    file-system-info file-writable-p find-backup-file-name insert-directory
-    load lock-file make-directory make-lock-file-name rename-file set-file-acl
-    set-file-modes set-file-selinux-context set-file-times unlock-file)
-  "Operations on the host names of their arguments.
-Their results are translated back.")
+(defun nsenter--file-name-p (file)
+  "Whether FILE is an ns name or dissected TRAMP vector."
+  (let ((vec (tramp-ensure-dissected-file-name file)))
+    (and vec (equal (tramp-file-name-method vec) "ns"))))
 
-(defconst nsenter--translated-link-operations
-  '(file-symlink-p file-attributes delete-file rename-file)
-  "Translated operations that act on a symbolic link itself, not its target.")
+(defun nsenter-file-name-handler (operation &rest args)
+  "Dispatch OPERATION with ARGS through TRAMP's ns backend."
+  (let ((handler (alist-get operation nsenter-file-name-handler-alist)))
+    (save-match-data
+      (cond ((eq handler #'nsenter--file-operation)
+             (apply handler operation args))
+            (handler (apply handler args))
+            (t (tramp-run-real-handler operation args))))))
 
-(defconst nsenter--raw-operations
-  '(abbreviate-file-name byte-compiler-base-file-name diff-latest-backup-file
-    dired-compress-file file-equal-p file-group-gid file-in-directory-p
-    file-name-as-directory file-name-sans-versions file-notify-rm-watch
-    file-notify-valid-p file-user-uid get-file-buffer list-system-processes
-    make-auto-save-file-name make-directory-internal make-nearby-temp-file
-    memory-info process-attributes vc-registered)
-  "Operations that need no translation.
-They only take names apart, or ask about the host.")
-
-(defun nsenter--handler (operation &rest arguments)
-  "Perform OPERATION on ARGUMENTS by the table that lists OPERATION.
-If that would start an environment while `non-essential' is non-nil,
-perform OPERATION as if there were no handler, as TRAMP does."
-  (let ((result (catch 'nsenter-non-essential
-                  (list (apply #'nsenter--perform operation arguments)))))
-    (if (eq result 'nsenter-non-essential)
-        (nsenter--apply-operation-bare operation arguments)
-      (car result))))
-
-(defun nsenter--perform (operation &rest arguments)
-  "Perform OPERATION on ARGUMENTS by the table that lists OPERATION."
-  (let ((custom (alist-get operation nsenter--custom-operations))
-        (nofollow (memq operation nsenter--translated-link-operations)))
-    (cond (custom (apply custom arguments))
-          ((memq operation nsenter--translated-operations)
-           (nsenter--translate-from-host
-            (apply operation
-                   (mapcar (lambda (argument)
-                             (nsenter--translate-to-host argument nofollow))
-                           arguments))))
-          ((memq operation nsenter--raw-operations)
-           (nsenter--apply-operation-bare operation arguments))
-          (t (error "No nsenter rule for the operation `%s'" operation)))))
-
-;;; Registering
-
-;; Emacs tries the entries of `file-name-handler-alist' in order, and TRAMP's
-;; match /ns: names too, so the handler goes first, and back to the front
-;; whenever TRAMP registers its handlers again.  TRAMP's conventions still
-;; apply to /ns: names where TRAMP looks at them: it knows "ns" as a method,
-;; so code that takes names apart with TRAMP works, and TRAMP completes
-;; /ns: with the names of the environments.
-
-(defun nsenter--register (&rest _)
-  "Put `nsenter--handler' first in `file-name-handler-alist'."
-  (setq file-name-handler-alist
-        (cons (cons nsenter--environment-prefix-regexp #'nsenter--handler)
-              (assoc-delete-all nsenter--environment-prefix-regexp
-                                file-name-handler-alist))))
-
-(nsenter--register)
-(advice-add 'tramp-register-file-name-handlers :after #'nsenter--register)
-
-;; Shells inside are /bin/sh, not the host's `shell-file-name', which may not
-;; exist inside.  TRAMP sets the same for its own methods, but only once TRAMP
-;; loads.
-(connection-local-set-profile-variables
- 'nsenter-connection-local-default-profile
- '((shell-file-name . "/bin/sh") (shell-command-switch . "-c")))
-(connection-local-set-profiles '(:application tramp :protocol "ns")
-                               'nsenter-connection-local-default-profile)
-
-(defvar tramp-methods)
-(declare-function tramp-set-completion-function "tramp")
-(with-eval-after-load 'tramp
-  (add-to-list 'tramp-methods '("ns"))
-  (tramp-set-completion-function
-   "ns" (list (list (lambda (_)
-                      (mapcar (lambda (environment)
-                                (list nil (car environment)))
-                              nsenter-environments))
-                    ""))))
+(add-to-list 'tramp-methods '("ns" (tramp-remote-shell "/bin/sh")
+                            (tramp-remote-shell-args ("-c"))))
+(tramp-register-foreign-file-name-handler #'nsenter--file-name-p
+                                          #'nsenter-file-name-handler)
 
 (provide 'nsenter)
 ;;; nsenter.el ends here
