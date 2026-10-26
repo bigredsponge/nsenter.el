@@ -6,8 +6,8 @@ nix_store := home_directory() / ".cache/nsenter-test-nix-store"
 check: compile lint
 
 compile:
-    {{emacs}} -Q --batch -L . --eval '(setq byte-compile-error-on-warn t)' -f batch-byte-compile nsenter.el
-    rm -f nsenter.elc
+    {{emacs}} -Q --batch -L . --eval '(setq byte-compile-error-on-warn t)' -f batch-byte-compile tramp-ns.el
+    rm -f tramp-ns.elc
 
 lint:
     {{emacs}} -Q --batch -l checkdoc --eval \
@@ -34,4 +34,4 @@ test-nix:
 
 [private]
 _test enter:
-    NSENTER_TEST_ENTER='{{enter}}' {{emacs}} -Q --batch -L . -l nsenter-test.el -f ert-run-tests-batch-and-exit < /dev/null
+    NSENTER_TEST_ENTER='{{enter}}' {{emacs}} -Q --batch -L . -l tramp-ns-test.el -f ert-run-tests-batch-and-exit < /dev/null
