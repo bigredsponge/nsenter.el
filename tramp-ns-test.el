@@ -1,4 +1,4 @@
-;;; nsenter-test.el --- Tests in real environments -*- lexical-binding: t; -*-
+;;; tramp-ns-test.el --- Tests in real environments -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
@@ -8,40 +8,40 @@
 ;;; Code:
 
 (require 'ert)
-(require 'nsenter)
+(require 'tramp-ns)
 (require 'dired)
 (require 'compile)
 (require 'vc-git)
 (require 'shell)
 (require 'eshell)
 
-(setq nsenter-environments
+(setq tramp-ns-environments
       `(("test" :enter ,(split-string (getenv "NSENTER_TEST_ENTER")))))
-(defvar nsenter-test-root
-  (format "/ns:test:/tmp/nsenter-test-%d/" (emacs-pid))
+(defvar tramp-ns-test-root
+  (format "/ns:test:/tmp/tramp-ns-test-%d/" (emacs-pid))
   "The directory inside that a test makes and then deletes.")
 
-(defmacro nsenter-test-with-directory (&rest body)
-  "Evaluate BODY in a fresh `nsenter-test-root', deleted afterwards."
+(defmacro tramp-ns-test-with-directory (&rest body)
+  "Evaluate BODY in a fresh `tramp-ns-test-root', deleted afterwards."
   (declare (indent 0))
-  `(let ((default-directory nsenter-test-root))
+  `(let ((default-directory tramp-ns-test-root))
      (make-directory default-directory t)
      (unwind-protect (progn ,@body)
        (dolist (b (buffer-list))
          (when (with-current-buffer b
                  (and buffer-file-name
-                      (string-prefix-p nsenter-test-root buffer-file-name)))
+                      (string-prefix-p tramp-ns-test-root buffer-file-name)))
            (with-current-buffer b (set-buffer-modified-p nil))
            (kill-buffer b)))
-       (delete-directory nsenter-test-root t))))
+       (delete-directory tramp-ns-test-root t))))
 
-(defun nsenter-test-output (&rest args)
+(defun tramp-ns-test-output (&rest args)
   "Return the output of running ARGS inside, which must succeed."
   (with-temp-buffer
     (should (zerop (apply #'process-file (car args) nil t nil (cdr args))))
     (buffer-string)))
 
-(defun nsenter-test-wait (p)
+(defun tramp-ns-test-wait (p)
   "Wait for process P to exit successfully."
   (let ((deadline (+ (float-time) 20)))
     (while (and (process-live-p p) (< (float-time) deadline))
@@ -49,8 +49,8 @@
     (should-not (process-live-p p))
     (should (zerop (process-exit-status p)))))
 
-(ert-deftest nsenter-edit-and-files ()
-  (nsenter-test-with-directory
+(ert-deftest tramp-ns-edit-and-files ()
+  (tramp-ns-test-with-directory
     (let* ((file (expand-file-name "notes.txt"))
            (b (find-file-noselect file)))
       (with-current-buffer b
@@ -63,7 +63,7 @@
       (should (file-regular-p file))
       (should (file-readable-p file))
       (should (file-writable-p file))
-      (should (equal (nsenter-test-output "cat" "notes.txt") "first\nsecond\n"))
+      (should (equal (tramp-ns-test-output "cat" "notes.txt") "first\nsecond\n"))
       (copy-file file (expand-file-name "copy.txt"))
       (rename-file (expand-file-name "copy.txt") (expand-file-name "renamed.txt"))
       (should (member "renamed.txt" (directory-files default-directory)))
@@ -71,14 +71,14 @@
       (should (member file (directory-files default-directory t "notes")))
       (let ((local (file-local-copy file)))
         (unwind-protect
-            (should (equal (nsenter--read local) "first\nsecond\n"))
+            (should (equal (tramp-ns--read local) "first\nsecond\n"))
           (delete-file local)))
       (delete-file (expand-file-name "renamed.txt"))
       (should-not (file-exists-p (expand-file-name "renamed.txt"))))))
 
-(ert-deftest nsenter-links-stay-in-root ()
-  (nsenter-test-with-directory
-    (nsenter-test-output
+(ert-deftest tramp-ns-links-stay-in-root ()
+  (tramp-ns-test-with-directory
+    (tramp-ns-test-output
      "sh" "-c"
      "mkdir dir; printf inner > dir/data; ln -s \"$PWD/dir\" absolute; ln -s dir relative; ln -s /../../etc/os-release rooted; ln -s missing dangling")
     (dolist (name '("absolute/data" "relative/data"))
@@ -94,21 +94,21 @@
     (delete-file (expand-file-name "absolute"))
     (should (file-exists-p (expand-file-name "dir/data")))
     ;; PATH is deliberately not normalized by expand-file-name first.
-    (should (equal (nsenter--read (nsenter--local (concat default-directory "rooted")))
-                   (nsenter-test-output "cat" "/etc/os-release")))))
+    (should (equal (tramp-ns--read (tramp-ns--local (concat default-directory "rooted")))
+                   (tramp-ns-test-output "cat" "/etc/os-release")))))
 
-(ert-deftest nsenter-processes ()
-  (nsenter-test-with-directory
-    (should (equal (string-trim (nsenter-test-output "pwd"))
+(ert-deftest tramp-ns-processes ()
+  (tramp-ns-test-with-directory
+    (should (equal (string-trim (tramp-ns-test-output "pwd"))
                    (directory-file-name (file-local-name default-directory))))
     (let ((process-environment (cons "NSENTER_TEST_BOUND=from-emacs" process-environment)))
-      (should (equal (nsenter-test-output "sh" "-c" "printf %s \"$NSENTER_TEST_BOUND\"")
+      (should (equal (tramp-ns-test-output "sh" "-c" "printf %s \"$NSENTER_TEST_BOUND\"")
                      "from-emacs")))
     (with-temp-buffer
       (let ((process-connection-type nil)
-            (p (start-file-process "nsenter-async" (current-buffer)
+            (p (start-file-process "tramp-ns-async" (current-buffer)
                                    "sh" "-c" "printf async")))
-        (nsenter-test-wait p)
+        (tramp-ns-test-wait p)
         (should (string-prefix-p "async" (buffer-string)))))
     (with-temp-buffer
       (should (zerop (shell-command "printf shell" (current-buffer))))
@@ -117,36 +117,36 @@
            (b (compilation-start "printf 'source.c:1: test\\n'"))
            (p (get-buffer-process b)))
       (unwind-protect
-          (progn (nsenter-test-wait p)
+          (progn (tramp-ns-test-wait p)
                  (with-current-buffer b
                    (should (string-match-p "source.c:1: test" (buffer-string)))))
         (kill-buffer b)))))
 
-(ert-deftest nsenter-shell-and-eshell ()
-  (nsenter-test-with-directory
+(ert-deftest tramp-ns-shell-and-eshell ()
+  (tramp-ns-test-with-directory
     (save-window-excursion
       (let* ((explicit-shell-file-name "/bin/sh")
-             (b (shell (generate-new-buffer "*nsenter-shell*")))
+             (b (shell (generate-new-buffer "*tramp-ns-shell*")))
              (p (get-buffer-process b)))
         (unwind-protect
             (progn
-              (process-send-string p "printf 'nsenter-shell-ok\\n'; exit\n")
-              (nsenter-test-wait p)
+              (process-send-string p "printf 'tramp-ns-shell-ok\\n'; exit\n")
+              (tramp-ns-test-wait p)
               (with-current-buffer b
-                (should (string-match-p "nsenter-shell-ok" (buffer-string)))))
+                (should (string-match-p "tramp-ns-shell-ok" (buffer-string)))))
           (when (process-live-p p) (delete-process p))
           (kill-buffer b))))
     (with-temp-buffer
-      (eshell-command "printf nsenter-eshell-ok" t)
-      (should (string-match-p "nsenter-eshell-ok" (buffer-string))))))
+      (eshell-command "printf tramp-ns-eshell-ok" t)
+      (should (string-match-p "tramp-ns-eshell-ok" (buffer-string))))))
 
-(ert-deftest nsenter-dired-and-git ()
-  (nsenter-test-with-directory
+(ert-deftest tramp-ns-dired-and-git ()
+  (tramp-ns-test-with-directory
     (skip-unless (executable-find "git" t))
-    (nsenter-test-output "git" "init" "-q")
+    (tramp-ns-test-output "git" "init" "-q")
     (write-region "tracked\n" nil (expand-file-name "tracked") nil 'silent)
-    (nsenter-test-output "git" "add" "tracked")
-    (nsenter-test-output "git" "-c" "user.name=Test" "-c" "user.email=test@example.org"
+    (tramp-ns-test-output "git" "add" "tracked")
+    (tramp-ns-test-output "git" "-c" "user.name=Test" "-c" "user.email=test@example.org"
                          "commit" "-qm" "Initial")
     (let ((file (expand-file-name "tracked")))
       (should (vc-git-registered file))
@@ -159,21 +159,21 @@
               (revert-buffer))
           (kill-buffer b))))))
 
-(ert-deftest nsenter-connection-lifetime ()
+(ert-deftest tramp-ns-connection-lifetime ()
   (let* ((vec (tramp-dissect-file-name "/ns:test:/"))
-         (p (nsenter--connection vec))
-         (pid (process-get p 'nsenter-pid)))
+         (p (tramp-ns--connection vec))
+         (pid (process-get p 'tramp-ns-pid)))
     (process-send-eof p)
     (let ((deadline (+ (float-time) 10)))
       (while (and (process-live-p p) (< (float-time) deadline))
         (accept-process-output p 0.05)))
     (should-not (file-exists-p (format "/proc/%d" pid)))
     (should (file-exists-p "/ns:test:/etc/os-release"))
-    (should-not (= pid (process-get (nsenter--connection vec) 'nsenter-pid)))))
+    (should-not (= pid (process-get (tramp-ns--connection vec) 'tramp-ns-pid)))))
 
-(ert-deftest nsenter-startup-timeouts ()
-  (let* ((nsenter-start-timeout 0.05)
-         (nsenter-environments
+(ert-deftest tramp-ns-startup-timeouts ()
+  (let* ((tramp-ns-start-timeout 0.05)
+         (tramp-ns-environments
           '(("slow" :enter ("sh" "-c" "sleep 2; exec \"$@\"" "test"))))
          (vec (tramp-dissect-file-name "/ns:slow:/")))
     (unwind-protect
@@ -182,15 +182,15 @@
             (should-not (file-exists-p "/ns:slow:/etc/os-release")))
           (should-not (tramp-get-connection-process vec))
           (dolist (timeout '(nil 0.15))
-            (setf (plist-get (cdar nsenter-environments) :timeout) timeout)
+            (setf (plist-get (cdar tramp-ns-environments) :timeout) timeout)
             (let ((start (float-time)))
               (should-error (file-exists-p "/ns:slow:/etc/os-release"))
               (let ((elapsed (- (float-time) start))
-                    (expected (or timeout nsenter-start-timeout)))
+                    (expected (or timeout tramp-ns-start-timeout)))
                 (should (>= elapsed expected))
                 (should (< elapsed (+ expected 1)))))
             (should-not (process-live-p (tramp-get-connection-process vec)))))
       (tramp-cleanup-connection vec))))
 
-(provide 'nsenter-test)
-;;; nsenter-test.el ends here
+(provide 'tramp-ns-test)
+;;; tramp-ns-test.el ends here

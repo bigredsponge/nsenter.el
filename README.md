@@ -1,4 +1,4 @@
-# nsenter.el
+# tramp-ns.el
 
 Fast access to your Linux namespaces.
 
@@ -26,8 +26,8 @@ use two techniques to provide fast access:
 Here is an example of how one could use the package.
 
 ```elisp
-(require 'nsenter)
-(setq nsenter-environments
+(require 'tramp-ns)
+(setq tramp-ns-environments
       '(("mypod" :enter ("podman" "exec" "-i" "mypod"))
         ("mybox" :enter ("distrobox" "enter" "mybox" "--"))))
 ```
@@ -38,7 +38,7 @@ You can even enter a Nix chroot (see
 https://nix.dev/manual/nix/latest/store/types/local-store#chroot).
 
 ```elisp
-(setq nsenter-environments
+(setq tramp-ns-environments
       '(("mynix" :enter ("nix shell nixpkgs#hello -c"))))
 ```
 
