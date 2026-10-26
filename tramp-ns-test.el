@@ -192,5 +192,33 @@
             (should-not (process-live-p (tramp-get-connection-process vec)))))
       (tramp-cleanup-connection vec))))
 
+(ert-deftest tramp-ns-home-paths ()
+  (tramp-ns-test-with-directory
+    (write-region "home data" nil (expand-file-name "relative.txt") nil 'silent)
+    (let* ((home (file-local-name default-directory))
+           (prefix (plist-get (cdar tramp-ns-environments) :enter))
+           (tramp-ns-environments
+            (cons (list "home" :enter (append prefix (list "env" (concat "HOME=" home))))
+                  tramp-ns-environments))
+           (vec (tramp-dissect-file-name "/ns:home:/")))
+      (unwind-protect
+          (progn
+            (dolist (name '("/ns:home:" "/ns:home:~" "/ns:home:~/"))
+              (should (equal (file-name-as-directory (expand-file-name name))
+                             (concat "/ns:home:" home)))
+              (should (file-directory-p name))
+              (should (member "relative.txt" (directory-files name))))
+            (should (member "relative.txt" (file-name-all-completions "rel" "/ns:home:")))
+            (should (equal (tramp-ns--read "/ns:home:relative.txt") "home data"))
+            (should (equal (tramp-ns--read "/ns:home:~/relative.txt") "home data"))
+            (let ((buffer (find-file-noselect "/ns:home:")))
+              (unwind-protect
+                  (with-current-buffer buffer
+                    (should (eq major-mode 'dired-mode))
+                    (should (equal (string-trim (tramp-ns-test-output "pwd"))
+                                   (directory-file-name home))))
+                (kill-buffer buffer))))
+        (tramp-cleanup-connection vec)))))
+
 (provide 'tramp-ns-test)
 ;;; tramp-ns-test.el ends here

@@ -11,7 +11,7 @@
 
 ;;; Code:
 
-(require 'tramp)
+(require 'tramp-sh)
 (require 'cl-lib)
 
 (defgroup tramp-ns nil "Local namespace environments."
@@ -223,7 +223,7 @@ VISIT, LOCKNAME and MUSTBENEW are as for `write-region'."
   (append
    (mapcar (lambda (op) (cons op (intern (concat "tramp-handle-" (symbol-name op)))))
            '(access-file copy-directory directory-file-name directory-files
-             directory-files-and-attributes dired-uncache expand-file-name
+             directory-files-and-attributes dired-uncache
              file-accessible-directory-p file-directory-p file-equal-p
              file-in-directory-p file-local-copy file-locked-p file-modes
              file-name-as-directory file-name-case-insensitive-p file-name-completion
@@ -238,7 +238,8 @@ VISIT, LOCKNAME and MUSTBENEW are as for `write-region'."
            '(add-name-to-file copy-file delete-directory delete-file file-attributes
              file-executable-p file-exists-p file-readable-p file-writable-p
              file-system-info make-directory rename-file set-file-modes set-file-times))
-   '((exec-path . tramp-ns--exec-path)
+   '((expand-file-name . tramp-sh-handle-expand-file-name)
+     (exec-path . tramp-ns--exec-path)
      (file-name-all-completions . tramp-ns--completions)
      (insert-file-contents . tramp-ns--insert) (write-region . tramp-ns--write)
      (process-file . tramp-ns--process-file) (make-process . tramp-ns--make-process)
