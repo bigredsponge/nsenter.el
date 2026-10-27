@@ -1,13 +1,53 @@
-;;; tramp-ns.el --- Local namespace access through TRAMP -*- lexical-binding: t; -*-
+;;; tramp-ns.el --- TRAMP backend for user-owned Linux namespaces -*- lexical-binding: t; -*-
 
-;; Version: 0.1
+;; Copyright (c) 2026 bigredsponge
+
+;; Author: bigredsponge
+;; URL: https://github.com/bigredsponge/tramp-ns
+;; Version: 0.1.0
+;; Keywords: comm, processes, files
 ;; Package-Requires: ((emacs "30.1"))
-;; SPDX-License-Identifier: GPL-3.0-or-later
+;; SPDX-License-Identifier: MIT
+
+;; This file is NOT part of GNU Emacs.
+
+;;; License:
+
+;; Permission is hereby granted, free of charge, to any person obtaining a copy
+;; of this software and associated documentation files (the "Software"), to deal
+;; in the Software without restriction, including without limitation the rights
+;; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+;; copies of the Software, and to permit persons to whom the Software is
+;; furnished to do so, subject to the following conditions:
+;;
+;; The above copyright notice and this permission notice shall be included in all
+;; copies or substantial portions of the Software.
+;;
+;; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+;; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+;; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+;; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+;; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+;; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+;; SOFTWARE.
 
 ;;; Commentary:
-;; Configure `tramp-ns-environments', then visit /ns:NAME:/path.
-;; Linux /proc and util-linux nsenter with --wdns are required.
-;; File access uses the host's credentials; programs retain those credentials.
+
+;; tramp-ns is a TRAMP backend for user-owned Linux namespaces, such as
+;; rootless Podman containers.  It reads and writes files through
+;; /proc/PID/root on the host, and runs commands inside the namespace
+;; with nsenter.  File access uses the host's credentials; programs
+;; retain those credentials.  It requires Linux and a util-linux nsenter
+;; that supports --wdns.
+;;
+;; Add entries to `tramp-ns-environments', each a name and an :enter
+;; command:
+;;
+;;   (setq tramp-ns-environments
+;;         '(("mypod" :enter ("podman" "exec" "-i" "mypod"))
+;;           ("mybox" :enter ("distrobox" "enter" "mybox" "--"))))
+;;
+;; Then visit /ns:mypod:/path/to/file.  See README.md for details.
 
 ;;; Code:
 
