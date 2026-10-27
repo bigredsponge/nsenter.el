@@ -1,4 +1,4 @@
-;;; tramp-ns-test.el --- Tests in real environments -*- lexical-binding: t; -*-
+;;; tramp-ns-test.el --- Tests for tramp-ns in real environments -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
